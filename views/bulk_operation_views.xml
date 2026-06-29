@@ -1,0 +1,298 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- ============================================================
+         LINES: standalone list view (raw import data as-is)
+         ============================================================ -->
+    <record id="view_bulk_operation_line_list" model="ir.ui.view">
+        <field name="name">bulk.operation.line.list</field>
+        <field name="model">bulk.operation.line</field>
+        <field name="arch" type="xml">
+            <list string="Imported Lines"
+                  decoration-danger="error_message != False"
+                  decoration-muted="is_processed"
+                  decoration-success="is_processed and not error_message">
+                <!-- Raw file columns - exactly as imported -->
+                <field name="date" string="Delivery Date"/>
+                <field name="distributor_id" string="Distributor ID" optional="show"/>
+                <field name="customer_code" string="Customer ID" optional="show"/>
+                <field name="customer_name" string="Customer Name"/>
+                <field name="customer_group" string="Group" optional="show"/>
+                <field name="branch_name" string="Branch"/>
+                <field name="edition" string="Edition"/>
+                <field name="delivered" string="Delivered"/>
+                <field name="returned" string="Returns"/>
+                <field name="net_qty" string="Net" readonly="1"/>
+                <!-- Resolved Odoo links (editable inline) -->
+                <field name="partner_id" string="↳ Matched Customer" optional="show"/>
+                <field name="product_id" string="↳ Matched Product" optional="show"/>
+                <field name="location_id" string="↳ Route Location" optional="show"/>
+                <field name="price_unit" string="Price" optional="show"/>
+                <field name="subtotal" string="Subtotal" sum="Total" readonly="1" optional="show"/>
+                <!-- Status -->
+                <field name="is_processed" string="Done" readonly="1"/>
+                <field name="error_message" string="Error"/>
+            </list>
+        </field>
+    </record>
+
+    <!-- LINES: search view so users can filter by date, branch, error state -->
+    <record id="view_bulk_operation_line_search" model="ir.ui.view">
+        <field name="name">bulk.operation.line.search</field>
+        <field name="model">bulk.operation.line</field>
+        <field name="arch" type="xml">
+            <search string="Search Lines">
+                <field name="customer_name" string="Customer Name"/>
+                <field name="branch_name" string="Branch"/>
+                <field name="edition" string="Edition"/>
+                <field name="date" string="Date"/>
+                <filter name="filter_errors" string="Has Errors"
+                        domain="[('error_message', '!=', False)]"/>
+                <filter name="filter_unprocessed" string="Not Yet Processed"
+                        domain="[('is_processed', '=', False)]"/>
+                <filter name="filter_processed" string="Processed"
+                        domain="[('is_processed', '=', True)]"/>
+                <separator/>
+                <group string="Group By">
+                    <filter name="group_date" string="Date" context="{'group_by': 'date'}"/>
+                    <filter name="group_branch" string="Branch" context="{'group_by': 'branch_name'}"/>
+                    <filter name="group_customer" string="Customer" context="{'group_by': 'customer_name'}"/>
+                    <filter name="group_edition" string="Edition" context="{'group_by': 'edition'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <!-- ============================================================
+         LINES: pivot view (aggregated map of imported data)
+         ============================================================ -->
+    <record id="view_bulk_operation_line_pivot" model="ir.ui.view">
+        <field name="name">bulk.operation.line.pivot</field>
+        <field name="model">bulk.operation.line</field>
+        <field name="arch" type="xml">
+            <pivot string="Imported Data Summary">
+                <field name="date" type="row"/>
+                <field name="customer_name" type="row"/>
+                <field name="branch_name" type="row"/>
+                <field name="edition" type="col"/>
+                <field name="delivered" type="measure"/>
+                <field name="returned" type="measure"/>
+                <field name="net_qty" type="measure"/>
+                <field name="subtotal" type="measure" string="Revenue"/>
+            </pivot>
+        </field>
+    </record>
+
+    <!-- LINES: graph view (visual overview) -->
+    <record id="view_bulk_operation_line_graph" model="ir.ui.view">
+        <field name="name">bulk.operation.line.graph</field>
+        <field name="model">bulk.operation.line</field>
+        <field name="arch" type="xml">
+            <graph string="Delivered vs Returned">
+                <field name="date" type="row"/>
+                <field name="delivered" type="measure"/>
+                <field name="returned" type="measure"/>
+            </graph>
+        </field>
+    </record>
+
+    <!-- LINES: action (opened by the "View Lines" button on the batch) -->
+    <record id="action_bulk_operation_line" model="ir.actions.act_window">
+        <field name="name">Imported Lines</field>
+        <field name="res_model">bulk.operation.line</field>
+        <field name="view_mode">list,pivot,graph</field>
+        <field name="search_view_id" ref="view_bulk_operation_line_search"/>
+        <field name="context">{'search_default_group_date': 1}</field>
+    </record>
+
+    <!-- ============================================================
+         BATCH: form view
+         ============================================================ -->
+    <record id="view_bulk_operation_batch_form" model="ir.ui.view">
+        <field name="name">bulk.operation.batch.form</field>
+        <field name="model">bulk.operation.batch</field>
+        <field name="arch" type="xml">
+            <form string="Bulk Operation Batch">
+                <header>
+                    <button name="action_import_file" string="Import File" type="object"
+                            class="oe_highlight"
+                            invisible="state != 'draft' or import_mode != 'quick'"/>
+                    <button name="action_open_import_wizard" string="Configure &amp; Import"
+                            type="object" class="oe_highlight"
+                            invisible="state != 'draft' or import_mode != 'standard'"/>
+                    <button name="action_view_lines" string="View Imported Data" type="object"
+                            invisible="state == 'draft'"/>
+                    <button name="action_batch_process" string="Batch Process" type="object"
+                            class="oe_highlight" invisible="state != 'imported'"
+                            confirm="This will create Sales Orders, Deliveries and Invoices for every valid line, processed date by day. Continue?"/>
+                    <field name="state" widget="statusbar"
+                           statusbar_visible="draft,imported,processed"/>
+                </header>
+
+                <sheet>
+                    <div class="oe_title">
+                        <h1><field name="name" readonly="1"/></h1>
+                    </div>
+
+                    <group invisible="state != 'draft'">
+                        <field name="import_mode" widget="radio"/>
+                        <p class="text-muted" colspan="2">
+                            <strong>Quick</strong> — predefined column mapping.
+                            <strong>Standard</strong> — choose fields, map columns, multi-sheet.
+                        </p>
+                    </group>
+
+                    <group>
+                        <group string="File">
+                            <field name="filename" invisible="1"/>
+                            <field name="import_file" filename="filename"
+                                   string="Select File (CSV or XLSX)"
+                                   readonly="state != 'draft'"/>
+                        </group>
+                        <group string="Summary" invisible="state == 'draft'">
+                            <field name="pending_line_count" string="Lines ready to process"/>
+                            <field name="error_line_count" string="Lines with errors"/>
+                        </group>
+                    </group>
+
+                    <!-- Error / info banner -->
+                    <div class="alert alert-warning mb-0" role="alert"
+                         invisible="error_line_count == 0 or state == 'draft'">
+                        <strong><field name="error_line_count"/> line(s) could not be matched</strong>
+                        — click <em>View Imported Data</em> above to see and fix them inline
+                        (edit the Customer, Product or Location columns), then come back and
+                        click <em>Batch Process</em>.
+                    </div>
+                    <div class="alert alert-success mb-0" role="alert"
+                         invisible="state != 'processed'">
+                        Batch complete — see the tabs below for the generated Sales Orders,
+                        Deliveries and Purchase Orders.
+                    </div>
+
+                    <notebook invisible="state == 'draft'">
+
+                        <!-- Tab 1: Sales (imported lines, inline preview) -->
+                        <tab string="Sales" name="sales_tab">
+                            <field name="line_ids">
+                                <list editable="bottom"
+                                      decoration-danger="error_message != False"
+                                      decoration-muted="is_processed"
+                                      decoration-success="is_processed and not error_message">
+                                    <field name="date"/>
+                                    <field name="customer_name" readonly="1" optional="show"/>
+                                    <field name="partner_id"/>
+                                    <field name="branch_name" readonly="1" optional="show"/>
+                                    <field name="location_id"/>
+                                    <field name="edition" readonly="1" optional="hide"/>
+                                    <field name="product_id"/>
+                                    <field name="delivered"/>
+                                    <field name="returned"/>
+                                    <field name="net_qty" readonly="1"/>
+                                    <field name="price_unit"/>
+                                    <field name="subtotal" sum="Total Revenue" readonly="1"/>
+                                    <field name="is_processed" readonly="1"/>
+                                    <field name="error_message" readonly="1"/>
+                                </list>
+                            </field>
+                        </tab>
+
+                        <!-- Tab 2: Purchases -->
+                        <tab string="Purchases">
+                            <field name="purchase_order_ids" readonly="1">
+                                <list>
+                                    <field name="name"/>
+                                    <field name="partner_id"/>
+                                    <field name="amount_total" sum="Total"/>
+                                    <field name="state"/>
+                                </list>
+                            </field>
+                        </tab>
+
+                        <!-- Tab 3: Deliveries -->
+                        <tab string="Deliveries">
+                            <field name="picking_ids" readonly="1">
+                                <list>
+                                    <field name="name"/>
+                                    <field name="partner_id"/>
+                                    <field name="picking_type_id"/>
+                                    <field name="location_id"/>
+                                    <field name="location_dest_id"/>
+                                    <field name="state"/>
+                                </list>
+                            </field>
+                        </tab>
+
+                        <!-- Tab 4: Sales Orders & Invoices -->
+                        <tab string="Sales Orders &amp; Invoices">
+                            <group>
+                                <field name="sale_order_ids" widget="many2many_tags" readonly="1"/>
+                                <field name="invoice_ids" widget="many2many_tags" readonly="1"/>
+                            </group>
+                        </tab>
+
+                    </notebook>
+                </sheet>
+                <chatter/>
+            </form>
+        </field>
+    </record>
+
+    <!-- ============================================================
+         BATCH: list view
+         ============================================================ -->
+    <record id="view_bulk_operation_batch_list" model="ir.ui.view">
+        <field name="name">bulk.operation.batch.list</field>
+        <field name="model">bulk.operation.batch</field>
+        <field name="arch" type="xml">
+            <list string="Bulk Batches">
+                <field name="name"/>
+                <field name="filename"/>
+                <field name="pending_line_count" string="Ready"/>
+                <field name="error_line_count" string="Errors"/>
+                <field name="state" widget="badge"
+                       decoration-success="state == 'processed'"
+                       decoration-info="state == 'imported'"/>
+            </list>
+        </field>
+    </record>
+
+    <!-- ============================================================
+         BATCH: action + menus
+         ============================================================ -->
+    <record id="action_bulk_operation_batch" model="ir.actions.act_window">
+        <field name="name">Bulk Operations</field>
+        <field name="res_model">bulk.operation.batch</field>
+        <field name="view_mode">list,form</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">Create a new bulk import run</p>
+            <p>
+                Upload the daily CSV or XLSX export, click <b>Import File</b> to stage
+                the rows, then <b>View Imported Data</b> to review every row exactly as
+                it appeared in the file. Fix any mismatches inline, then click
+                <b>Batch Process</b>.
+            </p>
+        </field>
+    </record>
+
+    <!-- ============================================================
+         PARTNER: add Default Route Location field on Sales & Purchase tab
+         ============================================================ -->
+    <record id="view_partner_form_extend" model="ir.ui.view">
+        <field name="name">res.partner.form.bulk.operations</field>
+        <field name="model">res.partner</field>
+        <field name="inherit_id" ref="base.view_partner_form"/>
+        <field name="arch" type="xml">
+            <field name="user_id" position="after">
+                <field name="x_route_location_id"
+                       groups="stock.group_stock_user"
+                       placeholder="Select route location..."/>
+            </field>
+        </field>
+    </record>
+
+    <menuitem id="menu_bulk_operations_root" name="Bulk Operations" sequence="10"/>
+    <menuitem id="menu_bulk_operations_batches" name="Batches"
+              parent="menu_bulk_operations_root"
+              action="action_bulk_operation_batch" sequence="1"/>
+
+</odoo>

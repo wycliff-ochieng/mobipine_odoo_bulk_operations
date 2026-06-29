@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="view_bulk_operation_import_mapping_tree" model="ir.ui.view">
+        <field name="name">bulk.operation.import.mapping.tree</field>
+        <field name="model">bulk.operation.import.mapping</field>
+        <field name="arch" type="xml">
+            <list editable="bottom" string="Column Mapping">
+                <field name="column_index" string="#" readonly="1" width="40"/>
+                <field name="column_name" string="Column Headers" readonly="1"/>
+                <field name="field_name" string="Map To..."/>
+                <field name="sample_values" string="Sample Data" readonly="1"/>
+                <field name="is_imported" string="Import"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_bulk_operation_import_wizard" model="ir.ui.view">
+        <field name="name">bulk.operation.import.wizard.form</field>
+        <field name="model">bulk.operation.import.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Import Wizard">
+                <group>
+                    <field name="batch_id" invisible="1"/>
+                    <field name="file" filename="file_name"
+                           string="Upload File (CSV or XLSX)"
+                           required="state == 'choose'"/>
+                    <field name="file_name" invisible="1"/>
+                    <field name="state" invisible="1"/>
+                </group>
+
+                <group invisible="file_type != 'csv' or state != 'choose'">
+                    <field name="separator" string="CSV Separator"/>
+                    <field name="has_headers"/>
+                </group>
+
+                <group invisible="state != 'mapping'">
+                    <field name="mapping_ids" nolabel="1"/>
+                </group>
+
+                <footer>
+                    <button name="action_parse_file" string="Parse File" type="object"
+                            class="oe_highlight" invisible="state != 'choose'"/>
+                    <button name="action_import" string="Import" type="object"
+                            class="oe_highlight" invisible="state != 'mapping'"/>
+                    <button string="Cancel" class="btn-secondary" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+</odoo>
