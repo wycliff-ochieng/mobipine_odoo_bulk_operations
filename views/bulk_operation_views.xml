@@ -153,6 +153,12 @@
                             <field name="pending_line_count" string="Lines ready to process"/>
                             <field name="error_line_count" string="Lines with errors"/>
                         </group>
+                        <group string="Processing Progress"
+                               invisible="state == 'draft' or (state == 'processed' and processing_progress >= 100)">
+                            <field name="processing_progress" widget="progressbar"
+                                   string="Progress"/>
+                            <field name="processing_status" string="Current Step"/>
+                        </group>
                     </group>
 
                     <!-- Error / info banner -->
