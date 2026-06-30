@@ -2,10 +2,15 @@
 import base64
 import csv
 import io
+import logging
+import threading
 from datetime import date, datetime, timedelta
 
+import odoo
 from odoo import models, fields, api, _
 from odoo.exceptions import UserError
+
+_logger = logging.getLogger(__name__)
 
 
 class BulkOperationBatch(models.Model):
@@ -55,6 +60,11 @@ class BulkOperationBatch(models.Model):
 
     import_file = fields.Binary(string='Upload File (CSV or XLSX)', attachment=True)
     filename = fields.Char(string='Filename')
+
+    processing_progress = fields.Float(string='Progress', readonly=True, default=0.0,
+        help="Processing progress (0-100). Updated periodically during background processing.")
+    processing_status = fields.Char(string='Status', readonly=True, default='',
+        help="Current status message shown during background processing.")
 
     line_ids = fields.One2many('bulk.operation.line', 'batch_id', string='Imported Lines')
     error_line_count = fields.Integer(compute='_compute_line_counts')
@@ -277,7 +287,11 @@ class BulkOperationBatch(models.Model):
 
         if lines_to_create:
             self.env['bulk.operation.line'].create(lines_to_create)
-            self.write({'state': 'imported'})
+            self.write({
+                'state': 'imported',
+                'processing_progress': 0.0,
+                'processing_status': '',
+            })
 
         unresolved = len([l for l in lines_to_create if l.get('error_message')])
         msg = _("Imported %s row(s).") % len(lines_to_create)
@@ -441,22 +455,72 @@ class BulkOperationBatch(models.Model):
         return line_date
 
     def action_batch_process(self):
-        """For every date present in the file (outer loop), and for every
-        customer who has lines on that date (inner loop): create one Sales
-        Order, confirm it, deliver it from the resolved branch location,
-        process any same-day returns, invoice it and register payment.
-        Then raise one consolidated Purchase Order across the whole batch.
+        """Validate lines and start background processing.
+
+        Processing is moved to a background thread so large imports don't
+        hit the HTTP request timeout (default: 120 s).  The chatter on
+        the batch will be updated when processing finishes.
 
         Each (date, customer) group runs in its own DB savepoint, so one
-        failure doesn't block the rest of the batch."""
+        failure doesn't block the rest of the batch.
+        """
         self.ensure_one()
+        if not self.line_ids.filtered(lambda l: not l.is_processed):
+            raise UserError(_("No lines are ready to process."))
+
+        self.message_post(body=_("Processing started in background…"))
+        threading.Thread(
+            target=self._process_in_background,
+            args=(self.id, self._cr.dbname),
+            daemon=True,
+        ).start()
+
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _('Processing Started'),
+                'message': _(
+                    'Batch processing started in the background. '
+                    'Refresh the page and check the chatter for results.'
+                ),
+                'sticky': True,
+            },
+        }
+
+    @api.model
+    def _process_in_background(self, batch_id, db_name):
+        """Entry point for the background thread: open a dedicated DB
+        cursor + environment and run the full processing workflow."""
+        try:
+            with odoo.sql_db.db_connect(db_name).cursor() as cr:
+                env = api.Environment(cr, odoo.SUPERUSER_ID, {})
+                batch = env['bulk.operation.batch'].browse(batch_id)
+                batch._execute_batch_process()
+                cr.commit()
+        except Exception:
+            _logger.exception("Background batch #%s processing crashed", batch_id)
+            try:
+                with odoo.sql_db.db_connect(db_name).cursor() as cr:
+                    env = api.Environment(cr, odoo.SUPERUSER_ID, {})
+                    batch = env['bulk.operation.batch'].browse(batch_id)
+                    batch.message_post(
+                        body=_("Batch processing crashed unexpectedly. Check the server logs."))
+                    cr.commit()
+            except Exception:
+                pass
+
+    def _execute_batch_process(self):
+        """Core processing: group lines by (date, partner), then process
+        in manageable chunks, committing progress periodically so the
+        user can see status by refreshing the form."""
+        self.ensure_one()
+        batch_id = self.id
 
         candidate_lines = self.line_ids.filtered(lambda l: not l.is_processed)
         if not candidate_lines:
             raise UserError(_("No lines are ready to process."))
 
-        # Re-validate now (not just at import time) so manual fixes in the
-        # list view are taken into account.
         invalid = candidate_lines.filtered(
             lambda l: not (l.partner_id and l.product_id and l.location_id) or l.returned > l.delivered
         )
@@ -476,7 +540,6 @@ class BulkOperationBatch(models.Model):
         if not valid_lines:
             raise UserError(_("No lines are ready to process. Check the Error column on the imported lines."))
 
-        # Group: { effective_date: { partner: lines } }, processed in date order.
         by_date = {}
         for line in valid_lines:
             eff_date = self._get_effective_date(line.date)
@@ -484,57 +547,110 @@ class BulkOperationBatch(models.Model):
             by_date[eff_date].setdefault(line.partner_id, self.env['bulk.operation.line'])
             by_date[eff_date][line.partner_id] |= line
 
-        sales_orders = self.env['sale.order']
-        invoices = self.env['account.move']
+        groups = []
+        for eff_date in sorted(by_date.keys()):
+            for partner, lines in by_date[eff_date].items():
+                groups.append((eff_date, partner, lines))
+
+        total = len(groups)
+        if not total:
+            return
+
+        self.write({
+            'state': 'imported',
+            'processing_progress': 0.0,
+            'processing_status': _('Starting — %s group(s) to process') % total,
+        })
+        self.env.cr.commit()
+
+        chunk_size = 15
+
+        wh = self._get_warehouse()
+        journal = self._get_payment_journal()
+        payment_method = journal.inbound_payment_method_line_ids[:1] if journal else False
+
+        all_sale_order_ids = []
+        all_invoice_ids = []
         net_demand = {}
         errors = []
         processed_count = 0
 
-        for eff_date in sorted(by_date.keys()):
-            for partner, lines in by_date[eff_date].items():
-                try:
-                    with self.env.cr.savepoint():
-                        sale_order = self._create_sale_order(partner, eff_date, lines)
-                        self._process_delivery(sale_order, lines)
-                        self._process_returns(sale_order, lines)
-                        invoice = self._process_invoice(sale_order)
+        for idx, (eff_date, partner, lines) in enumerate(groups, start=1):
+            try:
+                with self.env.cr.savepoint():
+                    sale_order = self._create_sale_order(partner, eff_date, lines, warehouse=wh)
+                    self._process_delivery(sale_order, lines, warehouse=wh)
+                    self._process_returns(sale_order, lines)
+                    invoice = self._process_invoice(
+                        sale_order, journal=journal, payment_method=payment_method)
 
-                        for line in lines:
-                            if line.net_qty > 0:
-                                net_demand[line.product_id] = net_demand.get(line.product_id, 0.0) + line.net_qty
+                    for line in lines:
+                        if line.net_qty > 0:
+                            net_demand[line.product_id] = net_demand.get(line.product_id, 0.0) + line.net_qty
 
-                        lines.write({'is_processed': True, 'error_message': False})
-                        sales_orders |= sale_order
-                        if invoice:
-                            invoices |= invoice
-                        processed_count += 1
-                except Exception as e:
-                    lines.write({'error_message': str(e)[:500]})
-                    errors.append(_("%(partner)s on %(date)s: %(error)s") % {
-                        'partner': partner.name, 'date': eff_date, 'error': str(e),
-                    })
-                    continue
+                    lines.write({'is_processed': True, 'error_message': False})
+                    all_sale_order_ids.append(sale_order.id)
+                    if invoice:
+                        all_invoice_ids.append(invoice.id)
+                    processed_count += 1
+            except Exception as e:
+                lines.write({'error_message': str(e)[:500]})
+                errors.append(_("%(partner)s on %(date)s: %(error)s") % {
+                    'partner': partner.name, 'date': eff_date, 'error': str(e),
+                })
+
+            if idx % chunk_size == 0 or idx == total:
+                progress = min(98.0, (idx / total) * 100.0)
+                status = _('Processed %(done)s/%(total)s groups') % {'done': idx, 'total': total}
+                self.write({
+                    'processing_progress': progress,
+                    'processing_status': status,
+                })
+                self.env.cr.commit()
+
+        self.write({
+            'processing_progress': 99.0,
+            'processing_status': _('Creating purchase orders…'),
+        })
+        self.env.cr.commit()
 
         purchase_orders = self._create_consolidated_po(net_demand)
 
         self.write({
-            'sale_order_ids': [(4, so.id) for so in sales_orders] or [(5, 0, 0)],
-            'invoice_ids': [(4, inv.id) for inv in invoices] or [(5, 0, 0)],
-            'purchase_order_ids': [(4, po.id) for po in purchase_orders] or [(5, 0, 0)],
+            'processing_progress': 100.0,
+            'processing_status': _('Completed'),
             'state': 'processed',
+            'sale_order_ids': [(4, so_id) for so_id in all_sale_order_ids],
+            'invoice_ids': [(4, inv_id) for inv_id in all_invoice_ids],
+            'purchase_order_ids': [(4, po.id) for po in purchase_orders],
         })
+        self.env.cr.commit()
 
-        summary = _("Batch processed: %(ok)s customer/date group(s) succeeded, %(err)s failed.") % {
+        summary = _("Batch processed: %(ok)s group(s) succeeded, %(err)s failed.") % {
             'ok': processed_count, 'err': len(errors),
         }
         if errors:
             summary += "<br/>" + "<br/>".join(errors)
         self.message_post(body=summary)
+        self.env.cr.commit()
 
-    def _create_sale_order(self, partner, eff_date, lines):
-        wh = self.env['stock.warehouse'].search([
+    def _get_warehouse(self):
+        return self.env['stock.warehouse'].search([
             ('company_id', '=', self.env.company.id),
         ], limit=1)
+
+    def _get_payment_journal(self):
+        journal = self.env['account.journal'].search([
+            ('type', '=', 'cash'), ('company_id', '=', self.env.company.id),
+        ], limit=1)
+        if not journal:
+            journal = self.env['account.journal'].search([
+                ('type', '=', 'bank'), ('company_id', '=', self.env.company.id),
+            ], limit=1)
+        return journal
+
+    def _create_sale_order(self, partner, eff_date, lines, warehouse=None):
+        wh = warehouse or self._get_warehouse()
         sale_order = self.env['sale.order'].create({
             'partner_id': partner.id,
             'date_order': fields.Datetime.to_datetime(eff_date),
@@ -551,9 +667,7 @@ class BulkOperationBatch(models.Model):
         sale_order.action_confirm()
         return sale_order
 
-    def _process_delivery(self, sale_order, lines):
-        # Usually every line in the group shares one branch location; if a
-        # row's location differs we still honour it move-by-move.
+    def _process_delivery(self, sale_order, lines, warehouse=None):
         location_by_product = {line.product_id.id: line.location_id for line in lines}
         primary_location = lines[:1].location_id
 
@@ -561,22 +675,22 @@ class BulkOperationBatch(models.Model):
             picking.location_id = primary_location.id
             for move in picking.move_ids:
                 move.location_id = location_by_product.get(move.product_id.id, primary_location).id
+                move.quantity = move.product_uom_qty
             picking.action_assign()
             insufficient = picking.move_ids.filtered(
-                lambda m: m.product_uom_qty > m.quantity and m.quantity <= 0
+                lambda m: m.product_uom_qty > 0 and m.quantity <= 0
             )
             if insufficient:
-                wh = self.env['stock.warehouse'].search([
-                    ('company_id', '=', self.env.company.id),
-                ], limit=1)
-                if wh:
+                wh = warehouse or self._get_warehouse()
+                if wh and wh.lot_stock_id:
                     picking.location_id = wh.lot_stock_id.id
                     for move in picking.move_ids:
                         move.location_id = wh.lot_stock_id.id
+                        move.quantity = move.product_uom_qty
                     picking.action_assign()
-            for move in picking.move_ids:
-                move.quantity = move.product_uom_qty
-            result = picking.with_context(skip_backorder=True, skip_sms=True).button_validate()
+            result = picking.with_context(
+                skip_backorder=True, skip_sms=True,
+            ).button_validate()
             if isinstance(result, dict):
                 raise UserError(_(
                     "Delivery could not be validated automatically "
@@ -625,27 +739,21 @@ class BulkOperationBatch(models.Model):
             move.quantity = move.product_uom_qty
         return_picking.with_context(skip_backorder=True, skip_sms=True).button_validate()
 
-    def _process_invoice(self, sale_order):
+    def _process_invoice(self, sale_order, journal=None, payment_method=None):
         invoice = sale_order._create_invoices()
         if not invoice:
             return invoice
         invoice.action_post()
-        self._register_payment(invoice)
+        self._register_payment(invoice, journal=journal, payment_method=payment_method)
         return invoice
 
-    def _register_payment(self, invoice):
-        journal = self.env['account.journal'].search([
-            ('type', '=', 'cash'), ('company_id', '=', self.env.company.id),
-        ], limit=1)
-        if not journal:
-            journal = self.env['account.journal'].search([
-                ('type', '=', 'bank'), ('company_id', '=', self.env.company.id),
-            ], limit=1)
+    def _register_payment(self, invoice, journal=None, payment_method=None):
+        journal = journal or self._get_payment_journal()
         if not journal:
             self.message_post(body=_("No cash or bank journal found - invoice %s left unpaid.") % invoice.name)
             return
 
-        payment_method = journal.inbound_payment_method_line_ids[:1]
+        payment_method = payment_method or journal.inbound_payment_method_line_ids[:1]
         if not payment_method:
             self.message_post(body=_("Journal %s has no inbound payment method - invoice %s left unpaid.") % (
                 journal.name, invoice.name))

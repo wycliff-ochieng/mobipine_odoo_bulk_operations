@@ -293,7 +293,11 @@ class BulkOperationImportWizard(models.TransientModel):
 
         if lines_to_create:
             self.env['bulk.operation.line'].create(lines_to_create)
-            self.batch_id.write({'state': 'imported'})
+            self.batch_id.write({
+                'state': 'imported',
+                'processing_progress': 0.0,
+                'processing_status': '',
+            })
 
         unresolved = len([l for l in lines_to_create if l.get('error_message')])
         msg = _("Imported %s row(s).") % len(lines_to_create)
